@@ -184,6 +184,8 @@ The priority resolution flow shows how a priority class reference in a job is tr
 
 ## 5. Preemption Based on Priority
 
+### 5.1 ClusterQueue Preemption Configuration
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ ClusterQueue Configuration                                                  │
@@ -191,15 +193,104 @@ The priority resolution flow shows how a priority class reference in a job is tr
 │ Preemption:                                                                 │
 │   WithinClusterQueue: PreemptionPolicyLowerPriority                         │ ◄── Enables priority-based preemption
 │   ReclaimWithinCohort: PreemptionPolicyAny                                  │
+│   BorrowWithinCohort:                                                       │
+│     Policy: LowerPriority                                                   │
+│     MaxPriorityThreshold: 0                                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Preemption Flow Based on Priority
+
+The following diagram illustrates how priority influences preemption decisions in Kueue:
+
+```
+High Priority Workload -----> Scheduler
+                                |
+                                | (Cannot fit in available quota)
+                                v
+                          Check Preemption Policy
+                                |
+                                |
+          +-------------------+ | +-------------------+
+          |                   | | |                   |
+          v                   v v                     v
+Within ClusterQueue     Reclaim Cohort        Borrow and Preempt
+(LowerPriority)        (LowerPriority)        (BorrowWithinCohort)
+          |                   |                       |
+          v                   v                       v
+  Find candidates with  Find candidates in    Find candidates with
+  lower priority       other ClusterQueues    priority < threshold
+          |                   |                       |
+          |                   |                       |
+          +-------------------+----------+------------+
+                                        |
+                                        v
+                              Order candidates by priority
+                                        |
+                                        v
+                              Select minimal set to preempt
+                                        |
+                                        v
+                              Evict selected workloads
+                                        |
+                                        v
+                              Schedule high-priority workload
+```
+
+This process ensures that higher priority workloads can be scheduled even when the cluster is fully utilized, by preempting lower-priority workloads according to the configured policies.
+
+### 5.3 Candidate Selection and Ordering
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ findCandidates(wl *kueue.Workload, cq *cache.ClusterQueueSnapshot)          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. Get priority of incoming workload: wlPriority := priority.Priority(wl)   │
+│ 2. Check preemption policy for ClusterQueue                                 │
+│ 3. For each workload in ClusterQueue:                                       │
+│    - Skip if candidatePriority > wlPriority                                 │
+│    - Skip if equal priority and policy doesn't allow equal priority         │
+│    - Add to candidates if using resources needed by incoming workload       │
+│ 4. Check preemption policy for Cohort                                       │
+│ 5. For each workload in other ClusterQueues in cohort:                      │
+│    - Skip if not borrowing resources                                        │
+│    - Skip if priority >= wlPriority (for LowerPriority policy)              │
+│    - Add to candidates if using resources needed by incoming workload       │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Scheduler                                                                   │
+│ candidatesOrdering(candidates []*workload.Info, cq, now)                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ 1. High priority workload cannot be scheduled due to resource constraints   │
-│ 2. Scheduler identifies lower priority workloads that could be preempted    │
-│ 3. Lower priority workloads are evicted to make room for higher priority    │
+│ Ordering criteria:                                                          │
+│ 1. Already evicted workloads first                                          │
+│ 2. Workloads from other ClusterQueues before same ClusterQueue              │
+│ 3. Lower priority workloads first                                           │
+│ 4. More recently admitted workloads first                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.4 Minimal Preemption Algorithm
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ minimalPreemptions(preemptionCtx, candidates, allowBorrowing)               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. Sort candidates (lowest priority first)                                  │
+│ 2. Simulate removing candidates one by one                                  │
+│ 3. Stop when incoming workload fits                                         │
+│ 4. Try to add back candidates in reverse order while still fitting          │
+│ 5. Return minimal set of workloads to preempt                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ IssuePreemptions(ctx, preemptor, targets)                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. For each target workload:                                                │
+│    - Create preemption message with reason and preemptor info               │
+│    - Mark workload with Evicted and Preempted conditions                    │
+│    - Record events and metrics                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 

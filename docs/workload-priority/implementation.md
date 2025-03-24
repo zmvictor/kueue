@@ -131,22 +131,158 @@ The fair sharing scheduler is designed to balance resource usage across differen
 
 ## 5. Priority in Preemption Decisions
 
-Priority also plays a crucial role in preemption decisions. When a high-priority workload cannot be scheduled due to resource constraints, the scheduler may decide to preempt (evict) lower-priority workloads to make room.
+Priority plays a crucial role in preemption decisions. When a high-priority workload cannot be scheduled due to resource constraints, the scheduler may decide to preempt (evict) lower-priority workloads to make room. The preemption logic is primarily implemented in the `pkg/scheduler/preemption` package.
 
-The preemption policy is configured in the ClusterQueue's specification:
+### 5.1 Preemption Policies
+
+ClusterQueues define preemption policies in their specification:
 
 ```yaml
 preemption:
   withinClusterQueue: PreemptionPolicyLowerPriority
   reclaimWithinCohort: PreemptionPolicyAny
+  borrowWithinCohort:
+    policy: LowerPriority
+    maxPriorityThreshold: 0
 ```
 
-When `withinClusterQueue` is set to `PreemptionPolicyLowerPriority`, the scheduler will only preempt workloads with lower priority than the workload being scheduled. This ensures that high-priority workloads can be scheduled even when the cluster is fully utilized by lower-priority workloads.
+Kueue supports several preemption policies:
 
-The preemption mechanism:
-1. Identifies workloads that could be preempted to make room for the higher-priority workload
-2. Selects the workloads with the lowest priorities first
-3. Evicts the selected workloads
-4. Attempts to schedule the higher-priority workload with the newly available resources
+- `Never`: No preemption is allowed
+- `LowerPriority`: Only workloads with lower priority than the pending workload can be preempted
+- `LowerOrNewerEqualPriority`: Workloads with lower priority or equal priority but created more recently can be preempted
+- `Any`: Any workload can be preempted regardless of priority
+
+These policies can be applied in different contexts:
+
+- `withinClusterQueue`: Controls preemption within a single ClusterQueue
+- `reclaimWithinCohort`: Controls preemption across ClusterQueues in a cohort
+- `borrowWithinCohort`: Controls preemption while borrowing resources
+
+### 5.2 How Priority Influences Candidate Selection
+
+The `findCandidates` method in `preemption.go` selects potential workloads for preemption based on their priority:
+
+```go
+func (p *Preemptor) findCandidates(wl *kueue.Workload, cq *cache.ClusterQueueSnapshot, frsNeedPreemption sets.Set[resources.FlavorResource]) []*workload.Info {
+    var candidates []*workload.Info
+    wlPriority := priority.Priority(wl)
+
+    if cq.Preemption.WithinClusterQueue != kueue.PreemptionPolicyNever {
+        considerSamePrio := (cq.Preemption.WithinClusterQueue == kueue.PreemptionPolicyLowerOrNewerEqualPriority)
+        preemptorTS := p.workloadOrdering.GetQueueOrderTimestamp(wl)
+
+        for _, candidateWl := range cq.Workloads {
+            candidatePriority := priority.Priority(candidateWl.Obj)
+            if candidatePriority > wlPriority {
+                continue
+            }
+
+            if candidatePriority == wlPriority && !(considerSamePrio && preemptorTS.Before(p.workloadOrdering.GetQueueOrderTimestamp(candidateWl.Obj))) {
+                continue
+            }
+            // Additional checks...
+            candidates = append(candidates, candidateWl)
+        }
+    }
+    // Additional checks for cohort preemption...
+    return candidates
+}
+```
+
+This function:
+1. Gets the priority of the incoming workload
+2. Based on the preemption policy, filters workloads that can be preempted
+3. For `LowerPriority` policy, only workloads with strictly lower priority are considered
+4. For `LowerOrNewerEqualPriority`, workloads with equal priority but created after the incoming workload are also considered
+
+### 5.3 Candidate Ordering
+
+Once candidates are selected, they are ordered using the `candidatesOrdering` function:
+
+```go
+func candidatesOrdering(candidates []*workload.Info, cq kueue.ClusterQueueReference, now time.Time) func(int, int) bool {
+    return func(i, j int) bool {
+        a := candidates[i]
+        b := candidates[j]
+        // Other criteria...
+        pa := priority.Priority(a.Obj)
+        pb := priority.Priority(b.Obj)
+        if pa != pb {
+            return pa < pb
+        }
+        // Additional ordering criteria...
+    }
+}
+```
+
+The ordering criteria are:
+1. Already evicted workloads first
+2. Workloads from other ClusterQueues in the cohort before ones in the same ClusterQueue
+3. **Workloads with lower priority first**
+4. More recently admitted workloads first
+
+This ensures that when selecting workloads to preempt, lower priority workloads are chosen before higher priority ones, which aligns with the goal of priority-based scheduling.
+
+### 5.4 Minimal Preemption Algorithm
+
+The core preemption algorithm is implemented in the `minimalPreemptions` function, which tries to find the minimal set of workloads to preempt:
+
+```go
+func minimalPreemptions(preemptionCtx *preemptionCtx, candidates []*workload.Info, allowBorrowing bool, allowBorrowingBelowPriority *int32) []*Target {
+    // Simulate removing all candidates from the ClusterQueue and cohort.
+    var targets []*Target
+    fits := false
+    for _, candWl := range candidates {
+        // Determine reason for preemption based on ClusterQueue and priority
+        preemptionCtx.snapshot.RemoveWorkload(candWl)
+        targets = append(targets, &Target{
+            WorkloadInfo: candWl,
+            Reason:       reason,
+        })
+        if workloadFits(preemptionCtx, allowBorrowing) {
+            fits = true
+            break
+        }
+    }
+    
+    // If we can't fit even after removing all candidates, restore and return nil
+    if !fits {
+        restoreSnapshot(preemptionCtx.snapshot, targets)
+        return nil
+    }
+    
+    // Try to add workloads back while still fitting
+    targets = fillBackWorkloads(preemptionCtx, targets, allowBorrowing)
+    return targets
+}
+```
+
+This algorithm:
+1. Simulates removing candidates one by one, starting with the lowest priority
+2. Once the incoming workload fits, it stops removing candidates
+3. Then tries to add back candidates in reverse order, as long as the incoming workload still fits
+4. This ensures that only the minimal set of workloads is preempted
+
+### 5.5 Preemption Execution
+
+When preemption targets are identified, the `IssuePreemptions` method marks them for eviction:
+
+```go
+func (p *Preemptor) IssuePreemptions(ctx context.Context, preemptor *workload.Info, targets []*Target) (int, error) {
+    // For each target workload
+    for _, target := range targets {
+        message := preemptionMessage(preemptor.Obj, target.Reason)
+        err := p.applyPreemption(ctx, target.WorkloadInfo.Obj, target.Reason, message)
+        // Record events and metrics
+    }
+    return successfullyPreempted, nil
+}
+```
+
+The preempted workloads are marked with an `Evicted` condition and a `Preempted` condition that includes:
+- The UID of the preempting workload
+- The reason for preemption (e.g., "prioritization in the ClusterQueue")
+- A human-readable message explaining the preemption
 
 This preemption capability is a key benefit of using the priority system, as it allows critical workloads to be scheduled even in resource-constrained environments.
